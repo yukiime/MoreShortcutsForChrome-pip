@@ -1,177 +1,226 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createController, disableAllPanels } from '../extension/controller.js';
-
-// Chrome API boundary double. It cannot prove Chrome's UI, gesture or restoration behavior.
-function fixture(tabs = [
-  { id: 7, windowId: 3, index: 1, active: true, url: 'chrome://newtab/' },
-  { id: 8, windowId: 4, index: 0, active: true, url: 'https://example.org/' }
-]) {
-  const options = new Map(), effects = [];
-  const api = {
-    runtime: { id: 'abc', getURL: path => `chrome-extension://abc/${path}` },
-    tabs: {
-      get: async id => { const tab = tabs.find(t => t.id === id); if (!tab) throw new Error('No tab'); return { ...tab }; },
-      query: async query => { effects.push(['query', query]); return tabs.filter(t => (query.windowId === undefined || t.windowId === query.windowId) && (!query.active || t.active)).map(t => ({ ...t })); },
-      update: async (id, update) => { effects.push(['update', id, update]); Object.assign(tabs.find(t => t.id === id), update); },
-      create: async details => { effects.push(['create', details]); return { id: 99, ...details }; }
-    },
-    sidePanel: {
-      getOptions: async ({ tabId }) => options.get(tabId) ?? { enabled: false, path: 'panel.html' },
-      setOptions: async value => { effects.push(['options', value]); options.set(value.tabId, { ...value }); },
-      setPanelBehavior: async value => { effects.push(['behavior', value]); },
-      close: async value => { effects.push(['close', value]); }
-    },
-    action: { enable: async () => {}, disable: async () => {}, setTitle: async () => {} }
-  };
-  const controller = createController(api, [{ id: 'one', title: 'Example', url: 'https://example.com/' }]);
-  const sender = { id: 'abc', url: 'chrome-extension://abc/panel.html?tabId=7&windowId=3' };
-  return { api, controller, options, effects, tabs, sender };
+import {createController} from '../extension/controller.js';
+const url='chrome-extension://test/host.html';
+const binding={hostTabId:1,hostWindowId:10,pipWindowId:20,token:'token'};
+function setup(saved=null){
+ const tabs=new Map([[1,{id:1,windowId:10,url,active:false}],[2,{id:2,windowId:10,url:'chrome://newtab/',active:true}]]);
+ const windows=new Map([[10,{id:10,type:'normal',focused:true,state:'normal'}],[20,{id:20,type:'normal',alwaysOnTop:true,focused:false,state:'normal',tabs:[]}]]);
+ const writes=[],nav=[],session={binding:saved};
+ const api={runtime:{getURL:p=>'chrome-extension://test/'+p},storage:{session:{get:async()=>structuredClone(session),set:async data=>Object.assign(session,structuredClone(data))}},windows:{getAll:async()=>structuredClone([...windows.values()]),get:async id=>{if(!windows.has(id))throw Error('missing window');return structuredClone(windows.get(id));},update:async(id,change)=>{writes.push([id,change]);Object.assign(windows.get(id),change);return structuredClone(windows.get(id));}},tabs:{get:async id=>{if(!tabs.has(id))throw Error('missing tab');return structuredClone(tabs.get(id));},query:async q=>structuredClone([...tabs.values()].filter(t=>t.windowId===q.windowId&&(!q.active||t.active))),update:async(id,change)=>{nav.push(['update',id,change]);Object.assign(tabs.get(id),change);},create:async change=>{nav.push(['create',change]);}}};
+ return {api,tabs,windows,writes,nav,session,c:createController(api,[{id:'example',url:'https://example.com/'}])};
 }
-
-test('fresh worker rebuilds NTP eligibility with global panel disabled and no automatic open', async () => {
-  const f = fixture();
-  await f.controller.initialize();
-  assert.equal(f.options.get(undefined)?.enabled, false);
-  assert.equal(f.options.get(7)?.enabled, true);
-  assert.equal(f.options.get(8)?.enabled, false);
-  assert.match(f.options.get(7).path, /tabId=7&windowId=3/);
-  assert.deepEqual(f.effects.find(e => e[0] === 'behavior'), ['behavior', { openPanelOnActionClick: false }]);
-  const restarted = createController(f.api, []);
-  await restarted.initialize();
-  assert.equal(f.options.get(7)?.enabled, true);
+test('restores on NTP and minimizes on regular page without focus requests',async()=>{const x=setup();await x.c.register(binding);x.tabs.get(2).url='https://example.com/';await x.c.reconcile();assert.equal(x.windows.get(20).state,'minimized');x.tabs.get(2).url='chrome://newtab/';await x.c.reconcile();assert.equal(x.windows.get(20).state,'normal');assert.ok(x.writes.every(([,v])=>!('focused'in v)));});
+test('PiP focus keeps target and allows current-tab navigation',async()=>{const x=setup();await x.c.register(binding);x.windows.get(10).focused=false;x.windows.get(20).focused=true;await x.c.reconcile(20);await x.c.openShortcut({id:'example',mode:'current',token:'token'});assert.equal(x.nav[0][1],2);assert.equal(x.nav[0][2].url,'https://example.com/');});
+test('external application focus hides PiP and returning to Chrome restores the retained session',async()=>{
+ const x=setup();await x.c.register(binding);x.windows.get(10).focused=false;
+ for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);await x.c.reconcile();
+ assert.equal(x.windows.get(20).state,'minimized');
+ assert.deepEqual(x.c.status().target,{tabId:2,windowId:10});
+ x.windows.get(10).focused=true;await x.c.reconcile(10);
+ assert.equal(x.windows.get(20).state,'normal');
+ assert.equal(x.c.status().pipWindowId,20);
 });
 
-test('switching tabs preserves the opened NTP configuration; same-tab pending navigation closes only its tab panel', async () => {
-  const f = fixture();
-  await f.controller.initialize();
-  f.effects.length = 0;
-  await f.controller.syncTab(8);
-  assert.equal(f.effects.some(e => e[0] === 'close'), false);
-  f.tabs[0].pendingUrl = 'https://example.net/';
-  await f.controller.syncTab(7);
-  assert.deepEqual(f.effects.find(e => e[0] === 'close'), ['close', { tabId: 7 }]);
-  assert.equal(f.options.get(7).enabled, false);
-  delete f.tabs[0].pendingUrl;
-  await f.controller.syncTab(7);
-  assert.equal(f.options.get(7).enabled, true);
+test('closing the active NTP hides without destroying the session and a new native tab restores it',async()=>{
+ const x=setup();await x.c.register(binding);x.tabs.delete(2);x.tabs.get(1).active=true;
+ await x.c.reconcile();assert.equal(x.windows.get(20).state,'minimized');
+ assert.equal(x.c.status().pipWindowId,20);assert.equal(x.c.status().paused,false);
+ x.tabs.get(1).active=false;x.tabs.set(3,{id:3,windowId:10,url:'chrome://newtab/',active:true});
+ await x.c.reconcile();assert.equal(x.windows.get(20).state,'normal');
+ assert.deepEqual(x.c.status().target,{tabId:3,windowId:10});
+ assert.deepEqual(x.writes,[[20,{state:'minimized'}],[20,{state:'normal'}]]);
 });
 
-test('an unexpected global opening is closed with windowId, never the tab close fallback', async () => {
-  const f = fixture();
-  await f.controller.panelOpened({ windowId: 3, path: 'panel.html' });
-  assert.deepEqual(f.effects, [['close', { windowId: 3 }]]);
+test('external focus still hides after the tracked Chrome tab navigates away from NTP',async()=>{
+ const x=setup();await x.c.register(binding);for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+ x.tabs.get(2).pendingUrl='https://example.org/';await x.c.reconcile();
+ assert.equal(x.windows.get(20).state,'minimized');assert.equal(x.c.status().target,null);
 });
 
-test('plain shortcut click replaces the bound active NTP even when a different window has an active tab', async () => {
-  const f = fixture();
-  await f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender);
-  assert.equal(f.tabs[0].url, 'https://example.com/');
-  assert.equal(f.tabs[1].url, 'https://example.org/');
-  assert.deepEqual(f.effects.find(e => e[0] === 'query'), ['query', { active: true, windowId: 3 }]);
+test('last selected Chrome window is retained across external focus and worker restoration',async()=>{
+ const x=setup();x.windows.set(30,{id:30,type:'normal',state:'normal',focused:false});
+ x.tabs.set(3,{id:3,windowId:30,url:'chrome://newtab/',active:true});
+ await x.c.register(binding);x.windows.get(10).focused=false;x.windows.get(30).focused=true;
+ await x.c.reconcile(30);x.windows.get(30).focused=false;for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+ assert.deepEqual(x.c.status().target,{tabId:3,windowId:30});
+ const restarted=createController(x.api,[]);await restarted.ready;await restarted.reconcile();
+ assert.deepEqual(restarted.status().target,{tabId:3,windowId:30});
+ assert.equal(x.windows.get(20).state,'minimized');
 });
 
-test('modified click creates a background tab in the same explicit window', async () => {
-  const f = fixture();
-  await f.controller.navigate({ shortcutId: 'one', disposition: 'background' }, f.sender);
-  assert.deepEqual(f.effects.find(e => e[0] === 'create'), ['create', { windowId: 3, index: 2, url: 'https://example.com/', active: false }]);
-  assert.equal(f.tabs[0].url, 'chrome://newtab/');
+test('external focus follows a newly active NTP in the same Chrome window rather than a stale tab',async()=>{
+ const x=setup();await x.c.register(binding);for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+ x.tabs.get(2).active=false;x.tabs.set(3,{id:3,windowId:10,url:'chrome://newtab/',active:true});
+ await x.c.reconcile();assert.deepEqual(x.c.status().target,{tabId:3,windowId:10});
+ assert.equal(x.windows.get(20).state,'minimized');
 });
 
-test('stale, moved, foreign, non-NTP and unlisted navigation requests have no navigation side effects', async () => {
-  for (const mutation of [
-    f => { f.tabs[0].active = false; },
-    f => { f.tabs[0].windowId = 4; },
-    f => { f.sender.id = 'other'; },
-    f => { f.sender.url = 'chrome-extension://abc/diagnostics.html'; },
-    f => { f.tabs[0].pendingUrl = 'https://example.org/'; },
-    f => { f.tabs[0].url = 'https://example.org/'; },
-    f => { f.tabs.length = 0; }
-  ]) {
-    const f = fixture(); mutation(f);
-    await assert.rejects(f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender));
-    assert.equal(f.effects.some(e => ['update', 'create'].includes(e[0])), false);
-  }
-  const f = fixture();
-  await assert.rejects(f.controller.navigate({ shortcutId: 'unknown', disposition: 'current' }, f.sender));
-  await assert.rejects(f.controller.navigate({ shortcutId: 'one', disposition: 'window' }, f.sender));
+test('rapid main-window then external focus retains the latest main window',async()=>{
+ for(const page of ['https://example.org/','chrome://newtab/'])for(const viaPopup of [false,true]){
+  const x=setup();await x.c.register(binding);
+  x.windows.get(10).focused=false;
+  x.windows.set(30,{id:30,type:'normal',state:'normal',focused:false});
+  x.tabs.set(3,{id:3,windowId:30,url:page,active:true});
+  const mainFocus=x.c.reconcile(30);
+  x.windows.set(40,{id:40,type:'popup',state:'normal',focused:false});
+  await Promise.all([mainFocus,...(viaPopup?[x.c.reconcile(40)]:[]),x.c.reconcile(-1)]);
+  assert.equal(x.c.status().lastMainWindowId,30);
+  assert.deepEqual(x.c.status().target,page==='chrome://newtab/'?{tabId:3,windowId:30}:null);
+  assert.equal(x.windows.get(20).state,'minimized');
+  const restarted=createController(x.api,[]);await restarted.ready;await restarted.reconcile();
+  assert.equal(restarted.status().lastMainWindowId,30);
+  assert.deepEqual(restarted.status().target,x.c.status().target);
+ }
 });
 
-test('overlapping updates re-read the latest tab state instead of leaving a stale NTP panel enabled', async () => {
-  const f = fixture();
-  await f.controller.initialize();
-  const first = f.controller.syncTab(7);
-  f.tabs[0].pendingUrl = 'https://example.net/';
-  const second = f.controller.syncTab(7);
-  await Promise.all([first, second]);
-  assert.equal(f.options.get(7).enabled, false);
+test('rapid PiP or popup focus then external focus does not replace the remembered main window',async()=>{
+ for(const focusedId of [20,30]){
+  const x=setup();await x.c.register(binding);x.windows.get(10).focused=false;
+  x.windows.set(30,{id:30,type:'popup',state:'normal',focused:false});
+  x.tabs.set(3,{id:3,windowId:30,url:'https://example.org/',active:true});
+  await Promise.all([x.c.reconcile(focusedId),x.c.reconcile(-1)]);
+  assert.equal(x.c.status().lastMainWindowId,10);
+  assert.deepEqual(x.c.status().target,{tabId:2,windowId:10});
+  assert.equal(x.windows.get(20).state,'minimized');
+ }
 });
 
-test('a tab closing during startup does not strand the worker or prevent healthy NTP navigation', async () => {
-  const f = fixture();
-  const originalSetTitle = f.api.action.setTitle;
-  f.api.action.setTitle = async details => {
-    if (details.tabId === 8) { f.tabs.splice(1); throw new Error('No tab with id: 8'); }
-    return originalSetTitle(details);
-  };
-  await f.controller.initialize();
-  assert.equal(f.options.get(7).enabled, true);
-  await f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender);
-  assert.equal(f.tabs[0].url, 'https://example.com/');
+test('completed popup reconciliation still remembers a preceding main-window focus',async()=>{
+ const x=setup();await x.c.register(binding);x.windows.get(10).focused=false;
+ x.windows.set(30,{id:30,type:'normal',state:'normal',focused:false});
+ x.windows.set(40,{id:40,type:'popup',state:'normal',focused:false});
+ x.tabs.set(3,{id:3,windowId:30,url:'https://example.org/',active:true});
+ await Promise.all([x.c.reconcile(30),x.c.reconcile(40)]);
+ for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+ assert.equal(x.c.status().lastMainWindowId,30);
+ assert.equal(x.c.status().target,null);
+ assert.equal(x.windows.get(20).state,'minimized');
 });
 
-test('a tab moving windows or losing activation during the query is rejected before navigation', async () => {
-  for (const mutate of [f => { f.tabs[0].windowId = 4; }, f => { f.tabs[0].active = false; }]) {
-    const f = fixture();
-    const originalQuery = f.api.tabs.query;
-    f.api.tabs.query = async query => {
-      const result = await originalQuery(query);
-      mutate(f);
-      return result;
-    };
-    await assert.rejects(f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender));
-    assert.equal(f.effects.some(e => ['update', 'create'].includes(e[0])), false);
-  }
+test('minimized or closed tracked main window hides PiP during external focus',async()=>{
+ for(const closed of [false,true]){
+  const x=setup();await x.c.register(binding);for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+  if(closed)x.windows.delete(10);else x.windows.get(10).state='minimized';
+  await x.c.reconcile();assert.equal(x.windows.get(20).state,'minimized');
+ }
+});
+test('pending navigation rejects navigation and hides PiP',async()=>{const x=setup();await x.c.register(binding);x.tabs.get(2).pendingUrl='https://example.org/';await assert.rejects(x.c.openShortcut({id:'example',mode:'current',token:'token'}));assert.equal(x.nav.length,0);await x.c.reconcile();assert.equal(x.windows.get(20).state,'minimized');});
+test('moved target cannot navigate another window',async()=>{const x=setup();await x.c.register(binding);x.tabs.get(2).windowId=30;await assert.rejects(x.c.openShortcut({id:'example',mode:'current',token:'token'}));assert.equal(x.nav.length,0);});
+test('inactive target cannot navigate',async()=>{const x=setup();await x.c.register(binding);x.tabs.get(2).active=false;await assert.rejects(x.c.openShortcut({id:'example',mode:'current',token:'token'}));});
+test('token and modes are checked before any navigation',async()=>{const x=setup();await x.c.register(binding);await assert.rejects(x.c.openShortcut({id:'example',mode:'current',token:'wrong'}));await assert.rejects(x.c.openShortcut({id:'example',mode:'evil',token:'token'}));assert.equal(x.nav.length,0);});
+test('modified click creates tab in explicit target window',async()=>{const x=setup();await x.c.register(binding);await x.c.openShortcut({id:'example',mode:'background',token:'token'});assert.deepEqual(x.nav[0],['create',{windowId:10,url:'https://example.com/',active:false}]);});
+test('foreign PiP URL rejected',async()=>{const x=setup();x.windows.get(20).tabs=[{url:'https://foreign.example/'}];await assert.rejects(x.c.register(binding));assert.equal(x.writes.length,0);});
+test('restore session verifies source and window and keeps target',async()=>{const x=setup({...binding,target:{tabId:2,windowId:10},paused:false,error:null});await x.c.ready;assert.equal(x.c.status().pipWindowId,20);await x.c.reconcile();assert.equal(x.c.status().target.tabId,2);});
+test('missing source clears restored state',async()=>{const x=setup(binding);x.tabs.delete(1);await x.c.ready;assert.equal(x.c.status(),null);assert.equal(x.session.binding,null);});
+test('hide failure pauses controller with visible error',async()=>{const x=setup();await x.c.register(binding);x.api.windows.update=async()=>{throw Error('cannot minimize');};x.tabs.get(2).url='https://example.com/';await x.c.reconcile();assert.equal(x.c.status().paused,true);assert.match(x.c.status().error,/cannot minimize/);});
+test('source navigation invalidates binding without manipulating other windows',async()=>{const x=setup();await x.c.register(binding);x.tabs.get(1).url='https://example.com/';await x.c.reconcile();assert.equal(x.c.status(),null);});
+test('latest tab state wins rapid reconciliation',async()=>{const x=setup();await x.c.register(binding);const first=x.c.reconcile();x.tabs.get(2).url='https://example.com/';const second=x.c.reconcile();await Promise.all([first,second]);assert.equal(x.windows.get(20).state,'minimized');});
+test('pause hides and resume rechecks NTP',async()=>{const x=setup();await x.c.register(binding);await x.c.setPaused(true);assert.equal(x.windows.get(20).state,'minimized');await x.c.setPaused(false);assert.equal(x.windows.get(20).state,'normal');});
+test('foreign extension source is rejected',async()=>{const x=setup();x.tabs.get(1).url='chrome-extension://foreign/host.html';await assert.rejects(x.c.register(binding));assert.equal(x.writes.length,0);});
+test('fulfilled no-op hiding is treated as compatibility failure',async()=>{const x=setup();await x.c.register(binding);x.api.windows.update=async id=>structuredClone(x.windows.get(id));x.tabs.get(2).url='https://example.com/';await x.c.reconcile();assert.equal(x.c.status().paused,true);assert.match(x.c.status().error,/minimized/);assert.equal(x.c.status().visibility,'normal');});
+test('window-control failure latches until explicit resume',async()=>{const x=setup();await x.c.register(binding);let calls=0;x.api.windows.update=async()=>{calls++;throw Error('unsupported');};x.tabs.get(2).url='https://example.com/';await x.c.reconcile();await x.c.reconcile();assert.equal(calls,1);await x.c.setPaused(false);assert.equal(calls,2);});
+test('focus change queued after click rejects stale navigation',async()=>{const x=setup();await x.c.register(binding);x.windows.set(30,{id:30,type:'normal',focused:true,state:'normal'});x.windows.get(10).focused=false;const click=x.c.openShortcut({id:'example',mode:'current',token:'token'});const change=x.c.reconcile(30);await assert.rejects(click);await change;assert.equal(x.nav.length,0);});
+test('initial PiP focus retains the active NTP in its source window',async()=>{
+ const x=setup();x.windows.get(10).focused=false;x.windows.get(20).focused=true;
+ await x.c.register(binding);
+ assert.deepEqual(x.c.status().target,{tabId:2,windowId:10});
+ assert.equal(x.c.status().paused,false);
+ assert.equal(x.writes.length,0);
+ await x.c.openShortcut({id:'example',mode:'background',token:'token'});
+ assert.equal(x.nav[0][1].windowId,10);
+});
+test('registration keeps its active NTP even if another app gains focus during initialization',async()=>{
+ for(const during of [false,true]){
+  const x=setup();x.windows.get(10).focused=false;x.windows.get(20).focused=true;
+  if(during){const get=x.api.tabs.get;let fired=false;x.api.tabs.get=async id=>{const tab=await get(id);if(id===1&&!fired){fired=true;for(const win of x.windows.values())win.focused=false;x.c.reconcile(-1);}return tab;};}
+  else {for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);}
+  await x.c.register(binding);await x.c.reconcile();
+  assert.deepEqual(x.c.status().target,{tabId:2,windowId:10});
+  assert.equal(x.c.status().visibility,'minimized');
+ }
 });
 
-test('two simultaneous current-tab clicks cannot overwrite an already navigated page', async () => {
-  const f = fixture();
-  const results = await Promise.allSettled([
-    f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender),
-    f.controller.navigate({ shortcutId: 'one', disposition: 'current' }, f.sender)
-  ]);
-  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
-  assert.equal(results.filter(r => r.status === 'rejected').length, 1);
-  assert.equal(f.effects.filter(e => e[0] === 'update').length, 1);
+
+test('a stale update snapshot is checked against the live PiP state before reporting failure',async()=>{
+ const x=setup();await x.c.register(binding);
+ x.api.windows.update=async(id,changes)=>{const before=structuredClone(x.windows.get(id));Object.assign(x.windows.get(id),changes);return before;};
+ x.tabs.get(2).url='https://example.com/';await x.c.reconcile();
+ assert.equal(x.c.status().paused,false);
+ assert.equal(x.c.status().visibility,'minimized');
 });
 
-test('fatal startup cleanup disables prior tab-specific options as well as the global default', async () => {
-  const f = fixture();
-  await f.controller.initialize();
-  assert.equal(f.options.get(7).enabled, true);
-  await disableAllPanels(f.api);
-  assert.equal(f.options.get(undefined).enabled, false);
-  assert.equal(f.options.get(7).enabled, false);
-  assert.equal(f.options.get(8).enabled, false);
+test('a successful response cannot mask a live no-op and requests closure of its own PiP',async()=>{
+ const x=setup();await x.c.register(binding);
+ x.api.windows.update=async id=>({...x.windows.get(id),state:'minimized'});
+ x.tabs.get(2).url='https://example.com/';await x.c.reconcile();
+ assert.equal(x.c.status().closeRequested,true);
+ assert.equal(x.c.status().visibility,'normal');
+ assert.match(x.c.status().error,/重新点击/);
 });
 
-test('navigation reads persisted edits inside the tab queue', async () => {
-  const f=fixture();
-  const controller=createController(f.api, [], async()=>{}, async()=>[{id:'one',url:'https://example.net/'}]);
-  await controller.navigate({shortcutId:'one',disposition:'current'},f.sender);
-  assert.equal(f.tabs[0].url,'https://example.net/');
+test('external focus after a latched restore failure still requests closing the overlay',async()=>{
+ const x=setup();await x.c.register(binding);await x.c.setPaused(true);
+ x.api.windows.update=async()=>{throw Error('unsupported');};
+ await x.c.setPaused(false);assert.equal(x.c.status().closeRequested,false);
+ x.windows.get(20).state='normal';for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);
+ assert.equal(x.c.status().closeRequested,true);
 });
-test('panel reads and edits reject inactive, moved, foreign and pending-navigation contexts', async () => {
-  for (const mutate of [f=>f.tabs[0].active=false, f=>f.tabs[0].windowId=4, f=>f.sender.id='other', f=>f.sender.url='chrome-extension://abc/diagnostics.html', f=>f.tabs[0].pendingUrl='https://example.org/']) {
-    const f=fixture(); mutate(f); let called=false;
-    await assert.rejects(f.controller.withPanelContext(f.sender,async()=>{called=true;}));
-    assert.equal(called,false);
-  }
+
+test('a newer focus event cancels stale hide failure before closing the PiP',async()=>{
+ const x=setup();await x.c.register(binding);let newer;
+ x.api.windows.update=async id=>{x.windows.get(10).focused=true;newer=x.c.reconcile(10);return structuredClone(x.windows.get(id));};
+ for(const win of x.windows.values())win.focused=false;await x.c.reconcile(-1);await newer;
+ assert.equal(x.c.status().paused,false);
+ assert.equal(x.c.status().closeRequested,false);
+ assert.equal(x.c.status().visibility,'normal');
 });
-test('panel operation can revalidate after asynchronous storage reads before committing', async () => {
-  const f=fixture(); let written=false;
-  await assert.rejects(f.controller.withPanelContext(f.sender,async(_,validate)=>{
-    f.tabs[0].pendingUrl='https://example.org/'; await validate(); written=true;
-  }));
-  assert.equal(written,false);
+
+test('a transient NONE with live Chrome focus never requests closing a valid NTP session',async()=>{
+ const x=setup();await x.c.register(binding);
+ x.api.windows.update=async()=>{throw Error('unsupported minimize');};
+ await x.c.reconcile(-1);await x.c.reconcile(10);
+ assert.equal(x.c.status().closeRequested,false);
+ assert.equal(x.c.status().paused,false);
+ await x.c.openShortcut({id:'example',mode:'background',token:'token'});
+ assert.deepEqual(x.nav[0],['create',{windowId:10,url:'https://example.com/',active:false}]);
+});
+
+test('a non-focus event during NONE preserves the grace for the next Chrome focus',async()=>{
+ const x=setup();await x.c.register(binding);x.windows.get(10).focused=false;
+ x.api.windows.update=async()=>{throw Error('unsupported minimize');};
+ const lost=x.c.reconcile(-1);const tabChanged=x.c.reconcile();
+ await new Promise(resolve=>setImmediate(resolve));
+ x.windows.get(10).focused=true;const regained=x.c.reconcile(10);
+ await Promise.all([lost,tabChanged,regained]);
+ assert.equal(x.c.status().closeRequested,false);
+ assert.equal(x.c.status().paused,false);
+ assert.equal(x.c.status().visibility,'normal');
+});
+
+test('closing after a previous restore error reports the observed state and how to restart',async()=>{
+ const x=setup();await x.c.register(binding);await x.c.setPaused(true);
+ x.api.windows.update=async()=>{throw Error('restore unsupported');};
+ await x.c.setPaused(false);
+ for(const win of x.windows.values())win.focused=false;
+ x.windows.get(20).state='normal';await x.c.reconcile(-1);
+ assert.equal(x.c.status().visibility,'normal');
+ assert.equal(x.c.status().closeRequested,true);
+ assert.match(x.c.status().error,/重新点击/);
+ assert.match(x.c.status().error,/restore unsupported/);
+});
+
+
+test('a background source tab survives worker restoration with the same document identity',async()=>{
+ const x=setup();x.tabs.get(1).url='chrome-extension://test/source.html';
+ const owner={...binding,sourceDocumentId:'ready-source'};
+ const contexts=[{documentId:'ready-source',tabId:1,contextType:'TAB',documentUrl:x.tabs.get(1).url}];
+ x.api.runtime.getContexts=async()=>structuredClone(contexts);await x.c.register(owner);
+ const restored=createController(x.api,[]);await restored.ready;assert.equal(restored.status().sourceDocumentId,'ready-source');
+ contexts[0].documentId='reloaded-source';await restored.reconcile();assert.equal(restored.status(),null);
+});
+test('a background source identity cannot be impersonated by another tab',async()=>{
+ const x=setup();x.tabs.get(1).url='chrome-extension://test/source.html';
+ x.api.runtime.getContexts=async()=>[{documentId:'fake',tabId:99,contextType:'TAB',documentUrl:x.tabs.get(1).url}];
+ await assert.rejects(x.c.register({...binding,sourceDocumentId:'fake'}));assert.equal(x.c.status(),null);
 });

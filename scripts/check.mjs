@@ -1,23 +1,16 @@
-import { readFile, access, readdir } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import {readFile,access,readdir} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import {resolve,dirname} from 'node:path';
+import {execFileSync} from 'node:child_process';
 import assert from 'node:assert/strict';
-import { validateShortcuts } from '../extension/core.js';
-
-const manifest = JSON.parse(await readFile('extension/manifest.json', 'utf8'));
-assert.equal(manifest.manifest_version, 3);
-const experimental = manifest.permissions.includes('debugger');
-assert.deepEqual([...manifest.permissions].sort(), experimental ? ['debugger', 'offscreen', 'sidePanel', 'storage', 'tabs'] : ['sidePanel', 'storage', 'tabs']);
-assert.deepEqual(manifest.optional_permissions, ['history']);
-assert.equal(manifest.chrome_url_overrides, undefined);
-assert.equal(manifest.content_scripts, undefined);
-assert.equal(manifest.host_permissions, undefined);
-const files = [manifest.background.service_worker, manifest.side_panel.default_path, manifest.options_ui.page, ...Object.values(manifest.icons), ...Object.values(manifest.action.default_icon)];
-await Promise.all(files.map(file => access(`extension/${file}`)));
-const entries = validateShortcuts(JSON.parse(await readFile('extension/shortcuts.json', 'utf8')));
-assert.equal(entries.length, 40);
-for (const name of await readdir('extension')) {
-  if (!name.endsWith('.js')) continue;
-  const result = spawnSync(process.execPath, ['--check', `extension/${name}`], { encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr);
-}
-console.log(`Static checks passed: MV3, ${manifest.permissions.length} required permissions + optional history, ${entries.length} valid shortcuts, all manifest resources present, JS syntax clean.`);
+import {validateShortcuts} from '../extension/core.js';
+const root=resolve(dirname(fileURLToPath(import.meta.url)),'..'),dir=resolve(root,'extension');
+const manifest=JSON.parse(await readFile(resolve(dir,'manifest.json'),'utf8'));
+assert.equal(manifest.manifest_version,3);assert.deepEqual(manifest.permissions,['tabs','storage']);
+for(const key of ['host_permissions','content_scripts','chrome_url_overrides','externally_connectable','web_accessible_resources'])assert.equal(manifest[key],undefined,key);
+for(const path of [manifest.background.service_worker,manifest.options_ui.page,'source.html','source.js','pip-session.js','pip-content.html',...Object.values(manifest.icons)])await access(resolve(dir,path));
+const html=await readFile(resolve(dir,'host.html'),'utf8');
+for(const [,path] of html.matchAll(/(?:src|href)="([^"]+)"/g)){assert.ok(!path.includes('://'));await access(resolve(dir,path));}
+for(const file of await readdir(dir))if(file.endsWith('.js'))execFileSync(process.execPath,['--check',resolve(dir,file)],{stdio:'pipe'});
+const shortcuts=validateShortcuts(JSON.parse(await readFile(resolve(dir,'shortcuts.json'),'utf8')));assert.equal(shortcuts.length,40);
+console.log('PASS: JS syntax, extension resources, MV3, 2 permissions, no override/injection/remote resources, 40 valid defaults.');

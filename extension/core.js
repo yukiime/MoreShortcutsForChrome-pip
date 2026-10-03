@@ -7,11 +7,11 @@ const NTP_PAGES = new Set([
 
 export function isNativeNtp(tab) {
   const candidate = tab?.pendingUrl || tab?.url;
-  if (!candidate) return false;
+  if (typeof candidate !== 'string' || !candidate) return false;
   try {
     const url = new URL(candidate);
-    const path = url.pathname || '/';
-    return !url.username && !url.password && NTP_PAGES.has(`${url.protocol}//${url.host}${path}`);
+    return !url.username && !url.password &&
+      NTP_PAGES.has(`${url.protocol}//${url.host}${url.pathname || '/'}`);
   } catch { return false; }
 }
 
@@ -25,42 +25,69 @@ export function validateShortcuts(document) {
       throw new Error('每个入口需要唯一的 id。');
     }
     seen.add(entry.id);
-    if (typeof entry.title !== 'string' || !entry.title.trim() || entry.title.length > 100) throw new Error('入口标题需要 1 至 100 个字符。');
-    const url = new URL(entry.url);
-    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('URL 仅允许无账号密码的 HTTP/HTTPS 地址。');
-    const icon = entry.icon ?? entry.title.trim().slice(0, 1);
+    if (typeof entry.title !== 'string' || !entry.title.trim() || entry.title.length > 100) {
+      throw new Error('入口标题需要 1 至 100 个字符。');
+    }
+    if (typeof entry.url !== 'string') throw new Error('URL 必须是 HTTP/HTTPS 地址字符串。');
+    let url;
+    try { url = new URL(entry.url); } catch { throw new Error('URL 地址无效。'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      throw new Error('URL 仅允许无账号密码的 HTTP/HTTPS 地址。');
+    }
+    const title = entry.title.trim();
+    const icon = entry.icon ?? [...title][0];
     const color = entry.color ?? '#5f6368';
-    if (typeof icon !== 'string' || !icon || [...icon].length > 3) throw new Error('文字图标需要 1 至 3 个字符。');
-    if (typeof color !== 'string' || !/^#[0-9a-f]{6}$/i.test(color)) throw new Error('颜色必须为六位十六进制。');
-    return { id: entry.id, title: entry.title.trim(), url: url.href, icon, color };
+    if (typeof icon !== 'string' || [...icon].length < 1 || [...icon].length > 3) {
+      throw new Error('文字图标需要 1 至 3 个字符。');
+    }
+    if (typeof color !== 'string' || !/^#[0-9a-f]{6}$/i.test(color)) {
+      throw new Error('颜色必须为六位十六进制。');
+    }
+    return { id: entry.id, title, url: url.href, icon, color };
   });
 }
 
-export function panelContext(value, extensionBase) {
+function pageIdentity(value) {
+  if (typeof value !== 'string') return null;
   try {
     const url = new URL(value);
-    const base = new URL(extensionBase);
-    if (url.protocol !== base.protocol || url.host !== base.host || url.pathname !== '/panel.html' || url.hash) return null;
-    if ([...url.searchParams].length !== 2) return null;
-    const tab = url.searchParams.get('tabId');
-    const window = url.searchParams.get('windowId');
-    if (!/^\d+$/.test(tab ?? '') || !/^\d+$/.test(window ?? '')) return null;
-    const tabId = Number(tab), windowId = Number(window);
-    return Number.isSafeInteger(tabId) && Number.isSafeInteger(windowId) && windowId > 0 ? { tabId, windowId } : null;
+    if (url.username || url.password) return null;
+    return `${url.protocol}//${url.host}${url.pathname}${url.hash}`;
   } catch { return null; }
 }
 
-export function normalizeShortcutEdit({ title, url } = {}) {
-  if (typeof title !== 'string' || !title.trim() || title.trim().length > 100) throw new Error('名称需要 1 至 100 个字符。');
-  if (typeof url !== 'string' || !url.trim()) throw new Error('请输入 HTTP/HTTPS 网址。');
-  const raw = url.trim();
-  // An explicit scheme is never rewritten into an HTTPS hostname.
-  const hostWithPort = /^(?:localhost|(?:[a-z0-9-]+\.)+[a-z0-9-]+|\[[0-9a-f:]+\]):\d+(?:[/?#]|$)/i.test(raw);
-  const candidate = !hostWithPort && /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`;
-  let parsed;
-  try { parsed = new URL(candidate); } catch { throw new Error('网址格式无效。'); }
-  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || !parsed.hostname) {
-    throw new Error('网址仅允许无账号密码的 HTTP/HTTPS 地址。');
+export function findPipWindow(before, after, hostUrl) {
+  if (!Array.isArray(before) || !Array.isArray(after)) return null;
+  const hostIdentity = pageIdentity(hostUrl);
+  if (!hostIdentity) return null;
+  const oldIds = new Set(before.map(window => window?.id));
+  const candidates = after.filter(window => Number.isSafeInteger(window?.id) && window.id >= 0 &&
+    !oldIds.has(window.id) && window.type === 'normal' && window.alwaysOnTop === true);
+  // Even a distinguishable foreign candidate makes creation ambiguous.
+  if (candidates.length !== 1) return null;
+  const window = candidates[0];
+  if (window.tabs !== undefined && !Array.isArray(window.tabs)) return null;
+  for (const tab of window.tabs ?? []) {
+    if (!tab || typeof tab !== 'object') return null;
+    // Chrome exposes Document PiP as about:blank, with its origin inherited from the opener.
+    // The before/after snapshot and unique always-on-top candidate remain mandatory.
+    for (const value of [tab.url, tab.pendingUrl]) {
+      if (value !== undefined && value !== 'about:blank' && pageIdentity(value) !== hostIdentity) return null;
+    }
   }
-  return { title: title.trim(), url: parsed.href };
+  return window;
+}
+
+export function navigationMode(event) {
+  if (event?.metaKey || event?.ctrlKey || event?.button === 1) return 'background';
+  return event?.shiftKey ? 'foreground' : 'current';
+}
+
+export function validateBounds(value) {
+  if (!value || typeof value !== 'object') return null;
+  const { left, top, width, height } = value;
+  if (![left, top, width, height].every(Number.isSafeInteger) ||
+    Math.abs(left) > 20000 || Math.abs(top) > 20000 ||
+    width < 200 || width > 1600 || height < 120 || height > 1200) return null;
+  return { left, top, width, height };
 }
